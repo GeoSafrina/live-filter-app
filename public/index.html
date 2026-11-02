@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Live Query Filter</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "Segoe UI", Roboto, sans-serif; background: #f8fafc; color: #0f172a; min-height: 100vh; padding: 24px 16px; }
+  .container { max-width: 1100px; margin: 0 auto; }
+  h1 { text-align: center; color: #2563eb; margin-bottom: 18px; }
+  .layout { display: grid; gap: 18px; grid-template-columns: 1fr; }
+  @media (min-width: 800px) { .layout { grid-template-columns: 240px 1fr; align-items: start; } }
+  aside { background: #fff; border-radius: 14px; padding: 16px; box-shadow: 0 3px 12px rgba(0,0,0,.07); }
+  aside h3 { font-size: .85rem; text-transform: uppercase; color: #64748b; margin: 12px 0 6px; }
+  aside h3:first-child { margin-top: 0; }
+  aside label { display: flex; gap: 8px; align-items: center; padding: 3px 0; cursor: pointer; }
+  input[type=search], select { width: 100%; padding: 11px; border: 1px solid #cbd5e1; border-radius: 10px; font: inherit; outline: none; background: #fff; }
+  input[type=search]:focus, select:focus { border-color: #3b82f6; box-shadow: 0 0 0 3px #dbeafe; }
+  .topbar { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+  .topbar input { flex: 1; min-width: 200px; }
+  .topbar select { width: auto; }
+  #status { color: #64748b; font-size: .85rem; margin-bottom: 12px; min-height: 20px; }
+  #grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); transition: opacity .15s; }
+  #grid.loading { opacity: .4; }
+  .card { background: #fff; border-radius: 14px; padding: 16px; box-shadow: 0 3px 12px rgba(0,0,0,.07); }
+  .card h3 { font-size: 1rem; margin-bottom: 8px; }
+  .pill { display: inline-block; background: #dbeafe; color: #1d4ed8; border-radius: 999px; padding: 2px 10px; font-size: .75rem; margin: 0 4px 6px 0; }
+  .pill.lvl { background: #ede9fe; color: #6d28d9; }
+  .card p { color: #475569; font-size: .88rem; }
+  .skeleton { height: 110px; border-radius: 14px; background: linear-gradient(90deg,#e2e8f0,#f1f5f9,#e2e8f0); background-size: 200% 100%; animation: sh 1.2s infinite; }
+  @keyframes sh { to { background-position: -200% 0; } }
+  .empty, .err { grid-column: 1 / -1; text-align: center; padding: 40px 10px; color: #64748b; }
+  .err { color: #b91c1c; }
+  .pager { display: flex; justify-content: center; align-items: center; gap: 14px; margin-top: 18px; }
+  .pager button { border: none; background: #2563eb; color: #fff; padding: 9px 16px; border-radius: 10px; font: inherit; font-weight: 600; cursor: pointer; }
+  .pager button:disabled { background: #cbd5e1; cursor: not-allowed; }
+  .clear { margin-top: 14px; width: 100%; border: 1px solid #cbd5e1; background: #fff; border-radius: 10px; padding: 8px; cursor: pointer; font: inherit; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>🔎 Live Query Filter</h1>
+  <div class="layout">
+    <aside>
+      <h3>Category</h3><div id="categories"></div>
+      <h3>Level</h3><div id="levels"></div>
+      <h3>Minimum rating</h3>
+      <select id="minRating"><option value="0">Any</option><option value="3.5">3.5+</option><option value="4">4.0+</option><option value="4.5">4.5+</option></select>
+      <button class="clear" id="clear">Clear filters</button>
+    </aside>
+    <main>
+      <div class="topbar">
+        <input id="search" type="search" placeholder="Search resources (debounced)..." />
+        <select id="sort">
+          <option value="rating_desc">Top rated</option>
+          <option value="rating_asc">Lowest rated</option>
+          <option value="duration_asc">Shortest first</option>
+          <option value="duration_desc">Longest first</option>
+          <option value="title">Default order</option>
+        </select>
+      </div>
+      <div id="status"></div>
+      <div id="grid"></div>
+      <div class="pager">
+        <button id="prev">← Prev</button>
+        <span id="pageInfo"></span>
+        <button id="next">Next →</button>
+      </div>
+    </main>
+  </div>
+</div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const state = { page: 1 };
+  let requestId = 0, apiCalls = 0, debounceTimer;
+
+  function debounce(fn, ms) {
+    return (...args) => { clearTimeout(debounceTimer); debounceTimer = setTimeout(() => fn(...args), ms); };
+  }
+
+  function checked(containerId) {
+    return [...document.querySelectorAll("#" + containerId + " input:checked")].map((i) => i.value);
+  }
+
+  function buildChecks(containerId, values) {
+    const box = $(containerId);
+    values.forEach((v) => {
+      const l = document.createElement("label");
+      const i = document.createElement("input"); i.type = "checkbox"; i.value = v;
+      i.onchange = () => { state.page = 1; load(); };
+      l.append(i, v); box.appendChild(l);
+    });
+  }
+
+  function showSkeleton() {
+    $("grid").innerHTML = "";
+    for (let i = 0; i < 6; i++) { const s = document.createElement("div"); s.className = "skeleton"; $("grid").appendChild(s); }
+  }
+
+  async function load() {
+    const myId = ++requestId; // ignore out-of-order responses
+    const params = new URLSearchParams({
+      search: $("search").value.trim(),
+      category: checked("categories").join(","),
+      level: checked("levels").join(","),
+      minRating: $("minRating").value,
+      sort: $("sort").value,
+      page: state.page,
+      limit: 12,
+    });
+    $("grid").classList.add("loading");
+    if (!$("grid").children.length) showSkeleton();
+    apiCalls++;
+    try {
+      const res = await fetch("/api/catalog?" + params);
+      if (!res.ok) throw new Error("Server error");
+      const data = await res.json();
+      if (myId !== requestId) return;
+      render(data);
+    } catch (err) {
+      if (myId !== requestId) return;
+      $("grid").innerHTML = '<div class="err">Something went wrong. Please try again.</div>';
+    } finally {
+      if (myId === requestId) $("grid").classList.remove("loading");
+    }
+  }
+
+  function render(data) {
+    const grid = $("grid");
+    grid.innerHTML = "";
+    state.page = data.page;
+    $("status").textContent = data.total + " result" + (data.total === 1 ? "" : "s") + "  ·  API calls so far: " + apiCalls;
+    $("pageInfo").textContent = "Page " + data.page + " of " + data.pages;
+    $("prev").disabled = data.page <= 1;
+    $("next").disabled = data.page >= data.pages;
+    if (!data.items.length) { grid.innerHTML = '<div class="empty">No results found. Try changing your filters.</div>'; return; }
+    data.items.forEach((c) => {
+      const d = document.createElement("div"); d.className = "card";
+      const h = document.createElement("h3"); h.textContent = c.title;
+      const a = document.createElement("span"); a.className = "pill"; a.textContent = c.category;
+      const b = document.createElement("span"); b.className = "pill lvl"; b.textContent = c.level;
+      const p = document.createElement("p"); p.textContent = "⏱ " + c.durationMinutes + " min   ⭐ " + c.rating;
+      d.append(h, a, b, p); grid.appendChild(d);
+    });
+  }
+
+  $("search").addEventListener("input", debounce(() => { state.page = 1; load(); }, 400));
+  $("sort").onchange = () => { state.page = 1; load(); };
+  $("minRating").onchange = () => { state.page = 1; load(); };
+  $("prev").onclick = () => { state.page--; load(); window.scrollTo({ top: 0, behavior: "smooth" }); };
+  $("next").onclick = () => { state.page++; load(); window.scrollTo({ top: 0, behavior: "smooth" }); };
+  $("clear").onclick = () => {
+    $("search").value = ""; $("minRating").value = "0"; $("sort").value = "rating_desc";
+    document.querySelectorAll("aside input:checked").forEach((i) => (i.checked = false));
+    state.page = 1; load();
+  };
+
+  (async function init() {
+    try {
+      const meta = await (await fetch("/api/meta")).json();
+      buildChecks("categories", meta.categories);
+      buildChecks("levels", meta.levels);
+    } catch {}
+    showSkeleton();
+    load();
+  })();
+</script>
+</body>
+</html>
